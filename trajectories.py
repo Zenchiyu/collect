@@ -15,9 +15,9 @@ def play(env, max_num_steps, num_envs):
     # initial_map = env.unwrapped.call("get_map", episode=0)
     
     trajectories = [[torch.zeros((0,2), dtype=torch.int)] for _ in range(num_envs)]
+    actions = torch.zeros((0,), dtype=torch.int)
     for num_steps in tqdm(range(0, max_num_steps, num_envs)):
         act = heuristic.act(obs).to(obs.device)
-        # print(obs.shape, num_steps, act)
         next_obs, rew, end, trunc, info = env.step(act)
 
         # Due to https://gymnasium.farama.org/api/vector/
@@ -28,13 +28,14 @@ def play(env, max_num_steps, num_envs):
             else:
                 # TODO: check when it resets. Can I get the correct last player pos too?
                 trajectories[n].append(torch.zeros((0,2), dtype=torch.int))
+        actions = torch.cat((actions, act.to("cpu")))
         obs = next_obs
     
     min_num_episodes = (min([len(episodes) for episodes in trajectories])//2)*2
     maps = [env.unwrapped.call("get_map", episode=ep) for ep in range(min_num_episodes)]
     # Sanity check when getting the map
     # assert torch.all(torch.cat([torch.isclose(torch.tensor(x), torch.tensor(y)) for x,y in zip(maps[0], initial_map)]))
-    return trajectories, maps
+    return trajectories, actions, maps
 
 def plot_trajectories_maps(trajectories, maps, num_envs, filename="trajectories.pdf"):
     plt.rcParams["axes.prop_cycle"] = plt.cycler("color", plt.cm.Set3.colors)
@@ -61,7 +62,7 @@ def plot_trajectories_maps(trajectories, maps, num_envs, filename="trajectories.
     plt.tight_layout()
     plt.savefig(filename, bbox_inches="tight", pad_inches=0, dpi=300)
 
-def plot_exploration_area(trajectory, map, nav_only=True, filename="overlap_one_episode"):
+def get_num_visits_matrix(trajectory, nav_only=True):
     num_visits_matrix = torch.zeros(64, 64, dtype=torch.int)
     for i, position in enumerate(trajectory):
         if nav_only and torch.all(position == trajectory[i-1]): # If do not move, do not count (it could also be due to obstacles!)
@@ -73,6 +74,10 @@ def plot_exploration_area(trajectory, map, nav_only=True, filename="overlap_one_
         view_mask = ((pos_y - 3 <= pos_rows) & (pos_rows <= pos_y + 3)) 
         view_mask = view_mask & ((pos_x -4 <= pos_cols) & (pos_cols <= pos_x + 4))
         num_visits_matrix[view_mask] += 1
+    return num_visits_matrix
+
+def plot_exploration_area(trajectory, map, nav_only=True, filename="overlap_one_episode"):
+    num_visits_matrix = get_num_visits_matrix(trajectory, nav_only=nav_only)
     mymap = torch.tensor(map)/255
     alpha = num_visits_matrix.repeat_interleave(16, dim=0).repeat_interleave(16, dim=1)[..., None].to(torch.float)
     x = alpha[alpha != 0]/alpha[alpha != 0].max()
@@ -151,13 +156,13 @@ def plot_exploration_areas(trajectories, maps, num_envs, nav_only=True, heatmap=
     return num_visits_matrices
 
 if __name__ == "__main__":
-    MAX_NUM_STEPS = 10_000 # 5_000, 10_000
-    NUM_ENVS = 10   # 5, 10
+    MAX_NUM_STEPS = 100_000 # 5_000, 10_000
+    NUM_ENVS = 100   # 5, 10
     assert MAX_NUM_STEPS % NUM_ENVS == 0
     DEVICE, WORLD_SIZE = "cuda" if torch.cuda.is_available() else "cpu", 64
     
     env = make_crafter_env(num_envs=NUM_ENVS, device=DEVICE, size=WORLD_SIZE)
-    trajectories, maps = play(env, num_envs=NUM_ENVS, max_num_steps=MAX_NUM_STEPS)
+    trajectories, actions, maps = play(env, num_envs=NUM_ENVS, max_num_steps=MAX_NUM_STEPS)
     
     # plot_trajectories_maps(trajectories, maps, num_envs=NUM_ENVS, filename=f"trajectories_{NUM_ENVS}_copies_{MAX_NUM_STEPS}_max_steps.pdf")
     # plot_exploration_areas(trajectories, maps, NUM_ENVS)
@@ -165,10 +170,9 @@ if __name__ == "__main__":
     # XXX: for a single map
     num_visits_matrices = []
     for n in range(NUM_ENVS):
-        num_visits_matrix = plot_exploration_area(trajectories[n][0], maps[0][0], nav_only=True)
+        num_visits_matrix = get_num_visits_matrix(trajectories[n][0], nav_only=True)
         num_visits_matrices.append(num_visits_matrix)
     
-    fig, axs = plt.subplots(2, NUM_ENVS//2, figsize=(30, 15))
     frequencies = {"uniques": [], "counts": []}
     max_num_visits = 1
     for n in range(NUM_ENVS):
@@ -179,21 +183,43 @@ if __name__ == "__main__":
         frequencies["counts"].append(counts)
     # This does not tell if we're going in circle within a large or small area
 
-    total_counts = torch.zeros((max_num_visits+1,))
+    # Store in same matrix of counts
+    counts = torch.zeros((NUM_ENVS, max_num_visits+1))
     for n in range(NUM_ENVS):
-        total_counts[frequencies["uniques"][n]] += frequencies["counts"][n]
-    uniques, avg_counts = torch.arange(1, max_num_visits+1), total_counts[1:]/10    # ignore 0
+        counts[n, frequencies["uniques"][n]] += frequencies["counts"][n]
+    # Avg, std counts ignoring cells with 0 visits
+    uniques, avg_counts, std_counts = torch.arange(1, max_num_visits+1), counts.mean(dim=0)[1:], counts.std(dim=0)[1:]
     probs = avg_counts/avg_counts.sum()
     num_observed_cells = torch.tensor([m.count_nonzero().item() for m in num_visits_matrices], dtype=torch.float)
     
     plt.figure()
-    plt.bar(uniques, probs)
+    plt.bar(uniques, probs, edgecolor="navy", fill=False)
+    plt.gca().spines["top"].set_visible(False)
+    plt.gca().spines["right"].set_visible(False)
+    plt.xticks([1] + torch.arange(5, max_num_visits+1, 5).tolist())
     plt.xlabel("# of visits of a cell")
-    plt.ylabel("Frequency of # of visits, averaged over $10$ trajectories")
-    # Frequency of cells with a certain number of visits
-    plt.title("Frequency of # of visits, averaged over $10$ trajectories\n"+\
+    plt.title("Frequency of # of visits, averaged over $100$ trajectories\n"+\
               f"The agents observes {num_observed_cells.mean():.2f}$\pm${num_observed_cells.std():.2f} cells in its FOV")
-    plt.savefig("freq_visits.pdf")
-    # Conditional probabilities, given we're using navigation actions
-    # Maximum proba to leave an area completely: probs[uniques >= 7].sum(), 7 is from the shortest way (vertical direction) to leave an area completely
-    # Maximum proba to leave an area completely and come back completely: probs[uniques >= 14].sum()
+    plt.savefig("freq_visits.pdf",  bbox_inches="tight", pad_inches=0, dpi=300)
+    # Conditional probabilities: given we're using working navigation actions
+    # Maximum cond. proba to leave an area completely: probs[uniques >= 7].sum(), 7 is from the shortest way (vertical direction) to leave an area completely
+    # Maximum cond. proba to leave an area completely and come back completely: probs[uniques >= 14].sum()
+    print("p >= 14", probs[uniques >= 14].sum())
+    print("p >= 2", probs[uniques >= 2].sum())
+    print("p >= 7", probs[uniques >= 7].sum())
+    print("p >= 18", probs[uniques >= 18].sum())
+
+
+    uniques, counts = torch.unique(actions, return_counts=True)
+    probs = counts/counts.sum()
+    plt.figure()
+    plt.bar(uniques, counts/counts.sum(), edgecolor="navy", fill=False)
+    plt.gca().spines["top"].set_visible(False)
+    plt.gca().spines["right"].set_visible(False)
+    plt.xticks(torch.arange(17))
+    plt.savefig("prob_actions.pdf",  bbox_inches="tight", pad_inches=0, dpi=300)
+
+    print("p nav action", probs[(uniques >= 1) & (uniques <= 4)].sum().item())
+    print("p non nav action", 1 - probs[(uniques >= 1) & (uniques <= 4)].sum().item())
+    print("p do action", probs[uniques == 5].item())
+    
